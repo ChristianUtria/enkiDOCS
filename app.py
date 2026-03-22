@@ -3,10 +3,21 @@ import requests
 import base64
 import re
 import json
+import os
 
 app = Flask(__name__)
 
-# ── Detectar tipo de URL ──────────────────────────────────────────────────────
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
+
+def github_headers(extra=None):
+    h = {"Accept": "application/vnd.github.v3+json"}
+    if GITHUB_TOKEN:
+        h["Authorization"] = f"token {GITHUB_TOKEN}"
+    if extra:
+        h.update(extra)
+    return h
+
+
 def detectar_tipo(url):
     url    = url.strip().rstrip("/")
     partes = [p for p in url.replace("https://github.com/","").replace("http://github.com/","").split("/") if p]
@@ -17,75 +28,113 @@ def detectar_tipo(url):
     return None, None, None
 
 
-# ── Perfil / Organización ─────────────────────────────────────────────────────
 def get_perfil_info(username):
-    headers  = {"Accept":"application/vnd.github.v3+json"}
-    user     = requests.get(f"https://api.github.com/users/{username}", headers=headers).json()
+    user     = requests.get(f"https://api.github.com/users/{username}", headers=github_headers()).json()
     all_repos = []
     page = 1
     while True:
-        r = requests.get(f"https://api.github.com/users/{username}/repos?per_page=100&page={page}&sort=pushed", headers=headers).json()
+        r = requests.get(f"https://api.github.com/users/{username}/repos?per_page=100&page={page}&sort=pushed", headers=github_headers()).json()
         if not isinstance(r, list) or not r: break
         all_repos.extend(r)
         if len(r) < 100: break
         page += 1
-    events   = requests.get(f"https://api.github.com/users/{username}/events/public?per_page=10", headers=headers).json()
+    events   = requests.get(f"https://api.github.com/users/{username}/events/public?per_page=10", headers=github_headers()).json()
     es_org   = user.get("type") == "Organization"
     miembros = []
     if es_org:
-        m = requests.get(f"https://api.github.com/orgs/{username}/members?per_page=6", headers=headers).json()
+        m = requests.get(f"https://api.github.com/orgs/{username}/members?per_page=6", headers=github_headers()).json()
         if isinstance(m, list): miembros = m
     return {"user":user,"repos":all_repos,"events":events if isinstance(events,list) else [],"miembros":miembros,"es_org":es_org}
 
 
-# ── Repo ──────────────────────────────────────────────────────────────────────
 def get_repo_info(owner, repo):
     base         = f"https://api.github.com/repos/{owner}/{repo}"
-    info         = requests.get(base).json()
-    languages    = requests.get(f"{base}/languages").json()
-    commits      = requests.get(f"{base}/commits?per_page=10").json()
-    contributors = requests.get(f"{base}/contributors?per_page=5").json()
-    contents     = requests.get(f"{base}/contents").json()
-    releases     = requests.get(f"{base}/releases?per_page=3").json()
-    topics_res   = requests.get(base, headers={"Accept":"application/vnd.github.mercy-preview+json"}).json()
+    info         = requests.get(base, headers=github_headers()).json()
+    languages    = requests.get(f"{base}/languages", headers=github_headers()).json()
+    commits      = requests.get(f"{base}/commits?per_page=10", headers=github_headers()).json()
+    contributors = requests.get(f"{base}/contributors?per_page=5", headers=github_headers()).json()
+    contents     = requests.get(f"{base}/contents", headers=github_headers()).json()
+    releases     = requests.get(f"{base}/releases?per_page=3", headers=github_headers()).json()
+    topics_res   = requests.get(base, headers=github_headers({"Accept":"application/vnd.github.mercy-preview+json"})).json()
 
     archivos = [f["name"] for f in contents if isinstance(contents, list)]
     topics   = topics_res.get("topics", [])
 
     dependencias = ""
     if "requirements.txt" in archivos:
-        r = requests.get(f"{base}/contents/requirements.txt").json()
+        r = requests.get(f"{base}/contents/requirements.txt", headers=github_headers()).json()
         dependencias = base64.b64decode(r["content"]).decode("utf-8")
     elif "package.json" in archivos:
-        r = requests.get(f"{base}/contents/package.json").json()
+        r = requests.get(f"{base}/contents/package.json", headers=github_headers()).json()
         dependencias = base64.b64decode(r["content"]).decode("utf-8")
 
     readme = ""
     for nr in ["README.md","readme.md","README.rst","README.txt","README"]:
         if nr in archivos:
-            r = requests.get(f"{base}/contents/{nr}").json()
+            r = requests.get(f"{base}/contents/{nr}", headers=github_headers()).json()
             readme = base64.b64decode(r["content"]).decode("utf-8")
             break
 
-    # Leer múltiples archivos clave
+    extensiones_legibles = {
+        ".py",".js",".ts",".go",".rb",".java",".rs",".php",
+        ".jsx",".tsx",".css",".html",".md",".yml",".yaml",
+        ".toml",".sh",".sql",".cfg",".ini",".json",".xml",
+        ".graphql",".prisma",".swift",".kt",
+    }
+    carpetas_clave = [
+        "src","app","api","routes","controllers","models","views",
+        "middleware","services","utils","helpers","lib","core",
+        "auth","login","config","database","db","tests","test",
+        "components","pages","hooks",
+    ]
+
     archivos_contenido = {}
-    extensiones_legibles = {".py",".js",".ts",".go",".rb",".java",".rs",".php",
-                             ".jsx",".tsx",".css",".html",".md",".yml",".yaml",
-                             ".toml",".sh",".sql"}
+
+    def leer_contenido(item):
+        fname = item.get("name","")
+        ext   = "." + fname.split(".")[-1].lower() if "." in fname else ""
+        if ext in extensiones_legibles and item.get("type") == "file":
+            try:
+                dl = item.get("download_url","")
+                if dl:
+                    r = requests.get(dl, timeout=5)
+                    if r.ok:
+                        return r.text[:4000]
+            except:
+                pass
+        return None
+
+    def leer_directorio(path, nivel=0):
+        if nivel > 2: return
+        try:
+            items = requests.get(f"{base}/contents/{path}", headers=github_headers()).json()
+            if not isinstance(items, list): return
+            for item in items:
+                nombre = item.get("name","")
+                ruta_completa = f"{path}/{nombre}"
+                if item.get("type") == "file":
+                    contenido = leer_contenido(item)
+                    if contenido and ruta_completa not in archivos_contenido:
+                        archivos_contenido[ruta_completa] = contenido
+                elif item.get("type") == "dir" and nivel < 2:
+                    if nivel == 0 or nombre.lower() in carpetas_clave:
+                        leer_directorio(ruta_completa, nivel + 1)
+        except:
+            pass
+
     if isinstance(contents, list):
         for item in contents:
-            if not isinstance(item, dict): continue
-            fname = item.get("name","")
-            ext   = "." + fname.split(".")[-1].lower() if "." in fname else ""
-            if ext in extensiones_legibles and item.get("type") == "file":
-                try:
-                    dl = item.get("download_url","")
-                    if dl:
-                        r = requests.get(dl)
-                        if r.ok:
-                            archivos_contenido[fname] = r.text[:3000]
-                except:
-                    pass
+            if item.get("type") == "file":
+                contenido = leer_contenido(item)
+                if contenido:
+                    archivos_contenido[item.get("name","")] = contenido
+
+    if isinstance(contents, list):
+        for item in contents:
+            if item.get("type") == "dir":
+                nombre = item.get("name","").lower()
+                if nombre in carpetas_clave:
+                    leer_directorio(item.get("name",""), nivel=1)
 
     codigo_principal = ""
     lang       = info.get("language","")
@@ -286,56 +335,16 @@ LANG_COLORS = {
 }
 
 
-def construir_perfil_html(pdata):
-    user=pdata["user"]; repos=pdata["repos"]; events=pdata["events"]
-    es_org=pdata["es_org"]; miembros=pdata["miembros"]
-    login=user.get("login",""); nombre=user.get("name") or login
-    bio=user.get("bio") or (user.get("description","") if es_org else "—")
-    avatar=user.get("avatar_url",""); blog=user.get("blog",""); location=user.get("location","")
-    company=user.get("company",""); twitter=user.get("twitter_username",""); email=user.get("email","")
-    creado=user.get("created_at","")[:10]; pub_repos=user.get("public_repos",0)
-    followers=user.get("followers",0); following=user.get("following",0)
-    gh_url=f"https://github.com/{login}"; tipo_label="Organization" if es_org else "User"
-    repos_validos=[r for r in repos if isinstance(r,dict)]
-    total_stars=sum(r.get("stargazers_count",0) for r in repos_validos)
-    total_forks=sum(r.get("forks_count",0) for r in repos_validos)
-
-    insignias=[]
-    if followers>10000: insignias.append(("Top contributor","#0969da"))
-    if followers>1000: insignias.append(("Popular","#1a7f37"))
-    if pub_repos>100: insignias.append(("Power user","#cf222e"))
-    elif pub_repos>50: insignias.append(("Prolific","#9a6700"))
-    if total_stars>10000: insignias.append(("Hall of Fame","#6e40c9"))
-    elif total_stars>1000: insignias.append(("Starred","#bf8700"))
-    if es_org: insignias.append(("Organization","#0969da"))
-    if blog: insignias.append(("Has website","#1a7f37"))
-    if twitter: insignias.append(("On Twitter","#1d9bf0"))
-    insignias_html="".join(f'<span class="badge" style="border-color:{c};color:{c}">{b}</span>' for b,c in insignias)
-
-    info_rows=""
-    if location: info_rows+=f'<div class="info-row"><span class="info-key">Location</span><span>{location}</span></div>'
-    if company:  info_rows+=f'<div class="info-row"><span class="info-key">Company</span><span>{company}</span></div>'
-    if email:    info_rows+=f'<div class="info-row"><span class="info-key">Email</span><span>{email}</span></div>'
-    if blog:     info_rows+=f'<div class="info-row"><span class="info-key">Website</span><a href="{blog}" target="_blank" class="info-link">{blog[:40]}</a></div>'
-    if twitter:  info_rows+=f'<div class="info-row"><span class="info-key">Twitter</span><span>@{twitter}</span></div>'
-    info_rows+=f'<div class="info-row"><span class="info-key">Member since</span><span>{creado}</span></div>'
-    info_rows+=f'<div class="info-row"><span class="info-key">GitHub</span><a href="{gh_url}" target="_blank" class="info-link">{gh_url}</a></div>'
-
-    stats_cards_html=f"""<div class="grid-1"><div class="card"><div class="card-header">GitHub Stats <span class="label"><a href="https://github.com/anuraghazra/github-readme-stats" target="_blank" class="info-link">github-readme-stats</a></span></div><div class="card-body" style="display:flex;flex-wrap:wrap;gap:12px;justify-content:center;padding:20px 16px"><img src="https://github-readme-stats-eight-theta.vercel.app/api?username={login}&show_icons=true&theme=github_dark&include_all_commits=true&count_private=true&hide_border=true" alt="Stats" style="height:160px;border-radius:6px;max-width:100%" onerror="this.style.display='none'"><img src="https://github-readme-stats-eight-theta.vercel.app/api/top-langs/?username={login}&layout=compact&langs_count=8&theme=github_dark&hide_border=true" alt="Top langs" style="height:160px;border-radius:6px;max-width:100%" onerror="this.style.display='none'"></div></div></div>"""
-
-    streak_html=f"""<div class="grid-1"><div class="card"><div class="card-header">Contribution Streak <span class="label"><a href="https://github.com/DenverCoder1/github-readme-streak-stats" target="_blank" class="info-link">streak-stats</a></span></div><div class="card-body" style="display:flex;justify-content:center;padding:16px"><img src="https://streak-stats.demolab.com?user={login}&theme=github-dark-blue&hide_border=true&date_format=M%20j%5B%2C%20Y%5D" alt="Streak" style="border-radius:6px;max-width:100%" onerror="this.style.display='none'"></div></div></div>"""
-
-    contrib_graph_html=f"""<div class="grid-1"><div class="card"><div class="card-header"><span class="lang-content active" data-l="es">Mapa de contribuciones</span><span class="lang-content" data-l="en">Contribution map</span> <span class="label"><a href="https://github.com/vn7n24fzkq/github-profile-summary-cards" target="_blank" class="info-link">profile-summary-cards</a></span></div><div class="card-body" style="display:flex;justify-content:center;padding:16px"><img src="https://github-profile-summary-cards.vercel.app/api/cards/profile-details?username={login}&theme=github_dark" alt="Contributions" style="border-radius:6px;max-width:100%;width:100%" onerror="this.style.display='none'"></div></div></div>"""
-
+def construir_repos_section(repos_validos):
     top5_repos=sorted(repos_validos,key=lambda r:r.get("stargazers_count",0),reverse=True)[:5]
-    max_stars_top5=max((r.get("stargazers_count",0) for r in top5_repos),default=1)
-    if max_stars_top5==0: max_stars_top5=1
+    max_stars=max((r.get("stargazers_count",0) for r in top5_repos),default=1)
+    if max_stars==0: max_stars=1
     top5_html=""
     for r in top5_repos:
         rname=r.get("name",""); rdesc=(r.get("description") or "Sin descripción")[:72]
         rstars=r.get("stargazers_count",0); rlang=r.get("language") or "—"
         rforks=r.get("forks_count",0); rurl=r.get("html_url",""); rupdated=r.get("updated_at","")[:10]
-        bar_pct=int((rstars/max_stars_top5)*100); lcolor=LANG_COLORS.get(rlang,"#8b949e")
+        bar_pct=int((rstars/max_stars)*100); lcolor=LANG_COLORS.get(rlang,"#8b949e")
         top5_html+=f'<div class="repo-card-item"><div class="repo-card-top"><a href="{rurl}" target="_blank" class="repo-card-name">{rname}</a><span class="repo-card-stars">★ {rstars:,}</span></div><div class="repo-card-desc">{rdesc}</div><div class="repo-card-bar"><div class="repo-card-bar-fill" style="width:{bar_pct}%;background:{lcolor}"></div></div><div class="repo-card-meta"><span class="repo-lang-dot" style="background:{lcolor}"></span><span class="repo-card-lang">{rlang}</span><span class="repo-card-forks">🍴 {rforks}</span><span class="repo-card-updated">{rupdated}</span></div></div>'
 
     contador={}
@@ -363,39 +372,98 @@ def construir_perfil_html(pdata):
     langs_unicos=sorted(set(r.get("language") or "—" for r in repos_validos if r.get("language")))
     lang_options="".join(f'<option value="{l}">{l}</option>' for l in langs_unicos)
     lang_colors_js=json.dumps(LANG_COLORS)
+    uid="ru"
 
-    all_repos_html=f"""<div class="grid-1"><div class="card"><div class="card-header"><span class="lang-content active" data-l="es">Todos los repositorios</span><span class="lang-content" data-l="en">All repositories</span><span class="label" id="repos-count">{len(repos_validos)} repos</span></div><div class="card-body" style="padding:12px 16px"><div class="repos-filter-bar"><input type="text" id="filter-search" placeholder="Search repos..." class="filter-input" oninput="filterRepos()"><select id="filter-lang" class="filter-select" onchange="filterRepos()"><option value="">All languages</option>{lang_options}</select><select id="filter-sort" class="filter-select" onchange="filterRepos()"><option value="stars">Stars</option><option value="forks">Forks</option><option value="updated">Updated</option><option value="name">Name</option></select><label class="filter-check"><input type="checkbox" id="filter-forks" onchange="filterRepos()"><span class="lang-inline active" data-l="es">Ocultar forks</span><span class="lang-inline" data-l="en">Hide forks</span></label></div><div id="repos-list-all" class="repos-list-all"></div></div></div></div>
+    all_repos_html=f"""<div class="grid-1"><div class="card"><div class="card-header"><span class="lang-content active" data-l="es">Todos los repositorios</span><span class="lang-content" data-l="en">All repositories</span><span class="label" id="{uid}-count">{len(repos_validos)} repos</span></div><div class="card-body" style="padding:12px 16px"><div class="repos-filter-bar"><input type="text" id="{uid}-search" placeholder="Search repos..." class="filter-input" oninput="filterRepos_{uid}()"><select id="{uid}-lang" class="filter-select" onchange="filterRepos_{uid}()"><option value="">All languages</option>{lang_options}</select><select id="{uid}-sort" class="filter-select" onchange="filterRepos_{uid}()"><option value="stars">Stars</option><option value="forks">Forks</option><option value="updated">Updated</option><option value="name">Name</option></select><label class="filter-check"><input type="checkbox" id="{uid}-forks" onchange="filterRepos_{uid}()"><span class="lang-inline active" data-l="es">Ocultar forks</span><span class="lang-inline" data-l="en">Hide forks</span></label></div><div id="{uid}-list" class="repos-list-all"></div></div></div></div>
     <script>
-    const REPOS_DATA={repos_json_str};
-    const LANG_COLORS_MAP={lang_colors_js};
-    function filterRepos(){{
-      const search=document.getElementById('filter-search').value.toLowerCase();
-      const lang=document.getElementById('filter-lang').value;
-      const sort=document.getElementById('filter-sort').value;
-      const hideFork=document.getElementById('filter-forks').checked;
-      let filtered=REPOS_DATA.filter(r=>{{
-        if(hideFork&&r.fork)return false;
-        if(lang&&r.lang!==lang)return false;
-        if(search&&!r.name.toLowerCase().includes(search)&&!r.desc.toLowerCase().includes(search))return false;
-        return true;
-      }});
-      filtered.sort((a,b)=>{{
-        if(sort==='stars')return b.stars-a.stars;
-        if(sort==='forks')return b.forks-a.forks;
-        if(sort==='updated')return b.updated.localeCompare(a.updated);
-        if(sort==='name')return a.name.localeCompare(b.name);
-        return 0;
-      }});
-      document.getElementById('repos-count').textContent=filtered.length+' repos';
-      const container=document.getElementById('repos-list-all');
-      if(!filtered.length){{container.innerHTML='<div style="color:var(--text-muted);font-size:13px;padding:12px 0">No repositories found.</div>';return;}}
-      container.innerHTML=filtered.map(r=>{{
-        const lc=LANG_COLORS_MAP[r.lang]||'#8b949e';
-        return `<div class="repo-row-item"><div class="repo-row-left"><a href="${{r.url}}" target="_blank" class="repo-card-name">${{r.name}}</a>${{r.fork?'<span class="repo-fork-badge">fork</span>':''}}<span class="repo-row-desc">${{r.desc||'—'}}</span></div><div class="repo-row-right"><span class="repo-lang-dot" style="background:${{lc}}"></span><span class="repo-card-lang" style="min-width:60px">${{r.lang}}</span><span class="repo-card-stars">★ ${{r.stars.toLocaleString()}}</span><span class="repo-card-forks">🍴 ${{r.forks}}</span><span class="repo-card-updated">${{r.updated}}</span></div></div>`;
-      }}).join('');
-    }}
-    filterRepos();
+    (function(){{
+      const DATA={repos_json_str};
+      const COLORS={lang_colors_js};
+      function filterRepos_{uid}(){{
+        const search=document.getElementById('{uid}-search').value.toLowerCase();
+        const lang=document.getElementById('{uid}-lang').value;
+        const sort=document.getElementById('{uid}-sort').value;
+        const hideFork=document.getElementById('{uid}-forks').checked;
+        let filtered=DATA.filter(r=>{{
+          if(hideFork&&r.fork)return false;
+          if(lang&&r.lang!==lang)return false;
+          if(search&&!r.name.toLowerCase().includes(search)&&!r.desc.toLowerCase().includes(search))return false;
+          return true;
+        }});
+        filtered.sort((a,b)=>{{
+          if(sort==='stars')return b.stars-a.stars;
+          if(sort==='forks')return b.forks-a.forks;
+          if(sort==='updated')return b.updated.localeCompare(a.updated);
+          if(sort==='name')return a.name.localeCompare(b.name);
+          return 0;
+        }});
+        document.getElementById('{uid}-count').textContent=filtered.length+' repos';
+        const container=document.getElementById('{uid}-list');
+        if(!filtered.length){{container.innerHTML='<div style="color:var(--text-muted);font-size:13px;padding:12px 0">No repositories found.</div>';return;}}
+        container.innerHTML=filtered.map(r=>{{
+          const lc=COLORS[r.lang]||'#8b949e';
+          return '<div class="repo-row-item"><div class="repo-row-left"><a href="'+r.url+'" target="_blank" class="repo-card-name">'+r.name+'</a>'+(r.fork?'<span class="repo-fork-badge">fork</span>':'')+'<span class="repo-row-desc">'+(r.desc||'—')+'</span></div><div class="repo-row-right"><span class="repo-lang-dot" style="background:'+lc+'"></span><span class="repo-card-lang" style="min-width:60px">'+r.lang+'</span><span class="repo-card-stars">★ '+r.stars.toLocaleString()+'</span><span class="repo-card-forks">🍴 '+r.forks+'</span><span class="repo-card-updated">'+r.updated+'</span></div></div>';
+        }}).join('');
+      }}
+      window.filterRepos_{uid}=filterRepos_{uid};
+      filterRepos_{uid}();
+    }})();
     </script>"""
+
+    return top5_html, langs_html, all_repos_html
+
+
+def construir_perfil_html(pdata):
+    user=pdata["user"]; repos=pdata["repos"]; events=pdata["events"]
+    es_org=pdata["es_org"]; miembros=pdata["miembros"]
+    login=user.get("login",""); nombre=user.get("name") or login
+    bio=user.get("bio") or (user.get("description","") if es_org else "—")
+    avatar=user.get("avatar_url",""); blog=user.get("blog",""); location=user.get("location","")
+    company=user.get("company",""); twitter=user.get("twitter_username",""); email=user.get("email","")
+    creado=user.get("created_at","")[:10]; pub_repos=user.get("public_repos",0)
+    followers=user.get("followers",0)
+    gh_url=f"https://github.com/{login}"; tipo_label="Organization" if es_org else "User"
+    repos_validos=[r for r in repos if isinstance(r,dict)]
+    total_stars=sum(r.get("stargazers_count",0) for r in repos_validos)
+    total_forks=sum(r.get("forks_count",0) for r in repos_validos)
+
+    insignias=[]
+    if not es_org:
+        if followers>10000: insignias.append(("Top contributor","#0969da"))
+        if followers>1000:  insignias.append(("Popular","#1a7f37"))
+    if pub_repos>100: insignias.append(("Power user","#cf222e"))
+    elif pub_repos>50: insignias.append(("Prolific","#9a6700"))
+    if total_stars>10000: insignias.append(("Hall of Fame","#6e40c9"))
+    elif total_stars>1000: insignias.append(("Starred","#bf8700"))
+    if es_org: insignias.append(("Organization","#0969da"))
+    if blog:   insignias.append(("Has website","#1a7f37"))
+    if not es_org and twitter: insignias.append(("On Twitter","#1d9bf0"))
+    insignias_html="".join(f'<span class="badge" style="border-color:{c};color:{c}">{b}</span>' for b,c in insignias)
+
+    info_rows=""
+    if location: info_rows+=f'<div class="info-row"><span class="info-key">Location</span><span>{location}</span></div>'
+    if company:  info_rows+=f'<div class="info-row"><span class="info-key">Company</span><span>{company}</span></div>'
+    if email:    info_rows+=f'<div class="info-row"><span class="info-key">Email</span><span>{email}</span></div>'
+    if blog:     info_rows+=f'<div class="info-row"><span class="info-key">Website</span><a href="{blog}" target="_blank" class="info-link">{blog[:40]}</a></div>'
+    if not es_org and twitter: info_rows+=f'<div class="info-row"><span class="info-key">Twitter</span><span>@{twitter}</span></div>'
+    info_rows+=f'<div class="info-row"><span class="info-key">Member since</span><span>{creado}</span></div>'
+    info_rows+=f'<div class="info-row"><span class="info-key">GitHub</span><a href="{gh_url}" target="_blank" class="info-link">{gh_url}</a></div>'
+
+    stats_section=""
+    if not es_org:
+        stats_section=f"""
+        <div class="grid-1"><div class="card"><div class="card-header">GitHub Stats <span class="label"><a href="https://github.com/anuraghazra/github-readme-stats" target="_blank" class="info-link">github-readme-stats</a></span></div><div class="card-body" style="display:flex;flex-wrap:wrap;gap:12px;justify-content:center;padding:20px 16px"><img src="https://github-readme-stats-eight-theta.vercel.app/api?username={login}&show_icons=true&theme=github_dark&include_all_commits=true&count_private=true&hide_border=true" alt="Stats" style="height:160px;border-radius:6px;max-width:100%" onerror="this.style.display='none'"><img src="https://github-readme-stats-eight-theta.vercel.app/api/top-langs/?username={login}&layout=compact&langs_count=8&theme=github_dark&hide_border=true" alt="Top langs" style="height:160px;border-radius:6px;max-width:100%" onerror="this.style.display='none'"></div></div></div>
+        <div class="grid-1"><div class="card"><div class="card-header">Contribution Streak <span class="label"><a href="https://github.com/DenverCoder1/github-readme-streak-stats" target="_blank" class="info-link">streak-stats</a></span></div><div class="card-body" style="display:flex;justify-content:center;padding:16px"><img src="https://streak-stats.demolab.com?user={login}&theme=github-dark-blue&hide_border=true&date_format=M%20j%5B%2C%20Y%5D" alt="Streak" style="border-radius:6px;max-width:100%" onerror="this.style.display='none'"></div></div></div>
+        <div class="grid-1"><div class="card"><div class="card-header"><span class="lang-content active" data-l="es">Mapa de contribuciones</span><span class="lang-content" data-l="en">Contribution map</span><span class="label"><a href="https://github.com/vn7n24fzkq/github-profile-summary-cards" target="_blank" class="info-link">profile-summary-cards</a></span></div><div class="card-body" style="display:flex;justify-content:center;padding:16px"><img src="https://github-profile-summary-cards.vercel.app/api/cards/profile-details?username={login}&theme=github_dark" alt="Contributions" style="border-radius:6px;max-width:100%;width:100%" onerror="this.style.display='none'"></div></div></div>"""
+
+    readme_tips_html=""
+    if not es_org:
+        readme_tips_html=f"""<div class="grid-1"><div class="card"><div class="card-header"><span class="lang-content active" data-l="es">Mejora tu README de perfil</span><span class="lang-content" data-l="en">Improve your profile README</span></div><div class="card-body"><div class="tips-intro"><span class="lang-content active" data-l="es">Crea un repo <code>{login}/{login}</code> con un README.md:</span><span class="lang-content" data-l="en">Create a repo <code>{login}/{login}</code> with a README.md:</span></div><div class="tips-grid"><div class="tip-item"><div class="tip-title">Stats + Languages</div><div class="tip-desc"><span class="lang-content active" data-l="es">Estadísticas y lenguajes.</span><span class="lang-content" data-l="en">Stats and languages.</span></div><a href="https://github.com/anuraghazra/github-readme-stats" target="_blank" class="tip-link">github-readme-stats →</a><div class="tip-code">![Stats](https://github-readme-stats.vercel.app/api?username={login}&show_icons=true&theme=github_dark)</div></div><div class="tip-item"><div class="tip-title">Streak</div><div class="tip-desc"><span class="lang-content active" data-l="es">Racha de commits.</span><span class="lang-content" data-l="en">Commit streak.</span></div><a href="https://github.com/DenverCoder1/github-readme-streak-stats" target="_blank" class="tip-link">streak-stats →</a><div class="tip-code">![Streak](https://streak-stats.demolab.com?user={login}&theme=github-dark-blue)</div></div><div class="tip-item"><div class="tip-title">Profile Summary</div><div class="tip-desc"><span class="lang-content active" data-l="es">Resumen de contribuciones.</span><span class="lang-content" data-l="en">Contribution summary.</span></div><a href="https://github.com/vn7n24fzkq/github-profile-summary-cards" target="_blank" class="tip-link">profile-summary-cards →</a><div class="tip-code">![Summary](https://github-profile-summary-cards.vercel.app/api/cards/profile-details?username={login}&theme=github_dark)</div></div><div class="tip-item"><div class="tip-title">Trophies</div><div class="tip-desc"><span class="lang-content active" data-l="es">Logros.</span><span class="lang-content" data-l="en">Achievements.</span></div><a href="https://github.com/ryo-ma/github-profile-trophy" target="_blank" class="tip-link">github-profile-trophy →</a><div class="tip-code">![Trophy](https://github-profile-trophy.vercel.app/?username={login}&theme=darkhub)</div></div><div class="tip-item"><div class="tip-title">Activity Graph</div><div class="tip-desc"><span class="lang-content active" data-l="es">Gráfico de actividad.</span><span class="lang-content" data-l="en">Activity graph.</span></div><a href="https://github.com/Ashutosh00710/github-readme-activity-graph" target="_blank" class="tip-link">activity-graph →</a><div class="tip-code">![Activity](https://github-readme-activity-graph.vercel.app/graph?username={login}&theme=github-compact)</div></div><div class="tip-item"><div class="tip-title">Visitor Badge</div><div class="tip-desc"><span class="lang-content active" data-l="es">Contador de visitas.</span><span class="lang-content" data-l="en">Visitor counter.</span></div><a href="https://visitor-badge.glitch.me" target="_blank" class="tip-link">visitor-badge →</a><div class="tip-code">![Visitors](https://visitor-badge.glitch.me/badge?page_id={login}.{login})</div></div></div></div></div></div>"""
+
+    if es_org:
+        stats_nums_html=f"""<div class="grid-3"><div class="card stat-card"><div class="card-body"><span class="stat-value">{pub_repos}</span><div class="stat-label">repos</div></div></div><div class="card stat-card"><div class="card-body"><span class="stat-value">{total_stars:,}</span><div class="stat-label">total stars</div></div></div><div class="card stat-card"><div class="card-body"><span class="stat-value">{total_forks:,}</span><div class="stat-label">total forks</div></div></div></div>"""
+    else:
+        stats_nums_html=f"""<div class="grid-4"><div class="card stat-card"><div class="card-body"><span class="stat-value">{pub_repos}</span><div class="stat-label">repos</div></div></div><div class="card stat-card"><div class="card-body"><span class="stat-value">{followers:,}</span><div class="stat-label">followers</div></div></div><div class="card stat-card"><div class="card-body"><span class="stat-value">{total_stars:,}</span><div class="stat-label">total stars</div></div></div><div class="card stat-card"><div class="card-body"><span class="stat-value">{total_forks:,}</span><div class="stat-label">total forks</div></div></div></div>"""
 
     labels_ev={"PushEvent":"pushed to","PullRequestEvent":"opened PR in","IssuesEvent":"opened issue in","WatchEvent":"starred","ForkEvent":"forked","CreateEvent":"created","DeleteEvent":"deleted branch in","IssueCommentEvent":"commented in","ReleaseEvent":"released"}
     actividad_html=""
@@ -410,15 +478,15 @@ def construir_perfil_html(pdata):
             mlogin=m.get("login",""); mavatar=m.get("avatar_url","")
             miembros_html+=f'<div class="member-item"><img src="{mavatar}" alt="{mlogin}" class="member-avatar" onerror="this.style.display=\'none\'"><span class="member-login">{mlogin}</span></div>'
 
-    readme_tips_html=f"""<div class="grid-1"><div class="card"><div class="card-header"><span class="lang-content active" data-l="es">Mejora tu README de perfil</span><span class="lang-content" data-l="en">Improve your profile README</span></div><div class="card-body"><div class="tips-intro"><span class="lang-content active" data-l="es">Crea un repo <code>{login}/{login}</code> con un README.md:</span><span class="lang-content" data-l="en">Create a repo <code>{login}/{login}</code> with a README.md:</span></div><div class="tips-grid"><div class="tip-item"><div class="tip-title">Stats + Languages</div><div class="tip-desc"><span class="lang-content active" data-l="es">Estadísticas y lenguajes.</span><span class="lang-content" data-l="en">Stats and languages.</span></div><a href="https://github.com/anuraghazra/github-readme-stats" target="_blank" class="tip-link">github-readme-stats →</a><div class="tip-code">![Stats](https://github-readme-stats.vercel.app/api?username={login}&show_icons=true&theme=github_dark)</div></div><div class="tip-item"><div class="tip-title">Streak</div><div class="tip-desc"><span class="lang-content active" data-l="es">Racha de commits.</span><span class="lang-content" data-l="en">Commit streak.</span></div><a href="https://github.com/DenverCoder1/github-readme-streak-stats" target="_blank" class="tip-link">streak-stats →</a><div class="tip-code">![Streak](https://streak-stats.demolab.com?user={login}&theme=github-dark-blue)</div></div><div class="tip-item"><div class="tip-title">Profile Summary</div><div class="tip-desc"><span class="lang-content active" data-l="es">Resumen de contribuciones.</span><span class="lang-content" data-l="en">Contribution summary.</span></div><a href="https://github.com/vn7n24fzkq/github-profile-summary-cards" target="_blank" class="tip-link">profile-summary-cards →</a><div class="tip-code">![Summary](https://github-profile-summary-cards.vercel.app/api/cards/profile-details?username={login}&theme=github_dark)</div></div><div class="tip-item"><div class="tip-title">Trophies</div><div class="tip-desc"><span class="lang-content active" data-l="es">Logros.</span><span class="lang-content" data-l="en">Achievements.</span></div><a href="https://github.com/ryo-ma/github-profile-trophy" target="_blank" class="tip-link">github-profile-trophy →</a><div class="tip-code">![Trophy](https://github-profile-trophy.vercel.app/?username={login}&theme=darkhub)</div></div><div class="tip-item"><div class="tip-title">Activity Graph</div><div class="tip-desc"><span class="lang-content active" data-l="es">Gráfico de actividad.</span><span class="lang-content" data-l="en">Activity graph.</span></div><a href="https://github.com/Ashutosh00710/github-readme-activity-graph" target="_blank" class="tip-link">activity-graph →</a><div class="tip-code">![Activity](https://github-readme-activity-graph.vercel.app/graph?username={login}&theme=github-compact)</div></div><div class="tip-item"><div class="tip-title">Visitor Badge</div><div class="tip-desc"><span class="lang-content active" data-l="es">Contador de visitas.</span><span class="lang-content" data-l="en">Visitor counter.</span></div><a href="https://visitor-badge.glitch.me" target="_blank" class="tip-link">visitor-badge →</a><div class="tip-code">![Visitors](https://visitor-badge.glitch.me/badge?page_id={login}.{login})</div></div></div></div></div></div>"""
+    top5_html, langs_html, all_repos_html = construir_repos_section(repos_validos)
 
     return f"""
     <div class="section-divider"><span class="lang-inline active" data-l="es">{"Organización" if es_org else "Perfil"}</span><span class="lang-inline" data-l="en">{"Organization" if es_org else "Profile"}</span></div>
     <div class="grid-1"><div class="card"><div class="card-header">{tipo_label}<span class="label">{gh_url}</span></div><div class="card-body"><div class="perfil-hero"><img src="{avatar}" alt="{login}" class="perfil-avatar" onerror="this.style.background='var(--bg-card)'"><div class="perfil-info"><div class="perfil-nombre">{nombre}</div><div class="perfil-login">@{login}</div><div class="perfil-bio">{bio}</div><div class="badges" style="margin-top:10px">{insignias_html}</div></div></div></div></div></div>
-    <div class="grid-4"><div class="card stat-card"><div class="card-body"><span class="stat-value">{pub_repos}</span><div class="stat-label">repos</div></div></div><div class="card stat-card"><div class="card-body"><span class="stat-value">{followers:,}</span><div class="stat-label">followers</div></div></div><div class="card stat-card"><div class="card-body"><span class="stat-value">{total_stars:,}</span><div class="stat-label">total stars</div></div></div><div class="card stat-card"><div class="card-body"><span class="stat-value">{total_forks:,}</span><div class="stat-label">total forks</div></div></div></div>
+    {stats_nums_html}
     <div class="grid-2"><div class="card"><div class="card-header"><span class="lang-content active" data-l="es">Informacion</span><span class="lang-content" data-l="en">Information</span></div><div class="card-body"><div class="info-table">{info_rows}</div></div></div><div class="card"><div class="card-header"><span class="lang-content active" data-l="es">Actividad reciente</span><span class="lang-content" data-l="en">Recent activity</span></div><div class="card-body scroll"><div class="timeline">{actividad_html or "<span style='color:var(--text-muted);font-size:13px'>No public activity</span>"}</div></div></div></div>
     {"" if not miembros_html else f'<div class="grid-1"><div class="card"><div class="card-header"><span class="lang-content active" data-l="es">Miembros públicos</span><span class="lang-content" data-l="en">Public members</span></div><div class="card-body"><div class="members-grid">{miembros_html}</div></div></div></div>'}
-    {stats_cards_html}{streak_html}{contrib_graph_html}
+    {stats_section}
     <div class="section-divider"><span class="lang-inline active" data-l="es">Repositorios</span><span class="lang-inline" data-l="en">Repositories</span></div>
     <div class="grid-2"><div class="card"><div class="card-header"><span class="lang-content active" data-l="es">Top 5 por estrellas</span><span class="lang-content" data-l="en">Top 5 by stars</span></div><div class="card-body scroll">{top5_html}</div></div><div class="card"><div class="card-header"><span class="lang-content active" data-l="es">Lenguajes</span><span class="lang-content" data-l="en">Languages</span></div><div class="card-body scroll">{langs_html}</div></div></div>
     {all_repos_html}
@@ -427,180 +495,160 @@ def construir_perfil_html(pdata):
 
 
 def construir_seccion_preguntas(data):
-    archivos_contenido = data.get("archivos_contenido", {})
-    nombre_repo        = data["info"].get("name","repo")
-    archivos_lista     = list(archivos_contenido.keys())
+    archivos_contenido=data.get("archivos_contenido",{})
+    nombre_repo=data["info"].get("name","repo")
+    archivos_lista=list(archivos_contenido.keys())
+    archivos_lower=[a.lower() for a in archivos_lista]
 
-    sugerencias = []
-    if any("auth" in a.lower() or "login" in a.lower() for a in archivos_lista):
-        sugerencias.append("¿Cómo funciona el login?")
-    if any("model" in a.lower() or "db" in a.lower() or "schema" in a.lower() for a in archivos_lista):
-        sugerencias.append("¿Cómo está la base de datos?")
-    if any("route" in a.lower() or "api" in a.lower() for a in archivos_lista):
-        sugerencias.append("¿Cuáles son las rutas de la API?")
-    if any("config" in a.lower() or ".env" in a.lower() for a in archivos_lista):
-        sugerencias.append("¿Cómo se configura el proyecto?")
-    if any("test" in a.lower() or "spec" in a.lower() for a in archivos_lista):
-        sugerencias.append("¿Cómo están los tests?")
-    if any("docker" in a.lower() for a in archivos_lista):
-        sugerencias.append("¿Cómo funciona Docker aquí?")
-    sugerencias += ["¿Qué dependencias usa?","¿Cómo está estructurado?"]
-    sugerencias = sugerencias[:6]
+    sugerencias=[]
+    if any("auth" in a or "login" in a or "session" in a or "jwt" in a for a in archivos_lower): sugerencias.append("¿Cómo funciona el login?")
+    if any("model" in a or "schema" in a or "db" in a or "database" in a or "migration" in a for a in archivos_lower): sugerencias.append("¿Cómo está la base de datos?")
+    if any("route" in a or "router" in a or "api" in a or "endpoint" in a or "controller" in a for a in archivos_lower): sugerencias.append("¿Cuáles son las rutas?")
+    if any("config" in a or ".env" in a or "setting" in a for a in archivos_lower): sugerencias.append("¿Cómo se configura?")
+    if any("test" in a or "spec" in a for a in archivos_lower): sugerencias.append("¿Cómo están los tests?")
+    if any("docker" in a for a in archivos_lower): sugerencias.append("¿Cómo funciona Docker?")
+    if any("middleware" in a for a in archivos_lower): sugerencias.append("¿Qué middlewares usa?")
+    if any("service" in a for a in archivos_lower): sugerencias.append("¿Cómo están los servicios?")
+    sugerencias+=["¿Qué dependencias usa?","¿Cómo está estructurado?","¿Qué hace el archivo principal?"]
+    sugerencias=sugerencias[:8]
 
-    sugerencias_html = "".join(
-        f'<button class="suggestion-btn" onclick="hacerPregunta(this)">{s}</button>'
-        for s in sugerencias
-    )
-
-    archivos_json = json.dumps(archivos_contenido)
-    readme_json   = json.dumps(data.get("readme",""))
+    sugerencias_html="".join(f'<button class="suggestion-btn" onclick="hacerPregunta(this)">{s}</button>' for s in sugerencias)
+    archivos_json=json.dumps(archivos_contenido)
+    readme_json=json.dumps(data.get("readme",""))
 
     return f"""
-    <div class="section-divider">
-      <span class="lang-inline active" data-l="es">Explorar el código</span>
-      <span class="lang-inline" data-l="en">Explore the code</span>
-    </div>
-    <div class="grid-1">
-      <div class="card">
-        <div class="card-header">
-          <span class="lang-content active" data-l="es">Pregunta sobre {nombre_repo}</span>
-          <span class="lang-content" data-l="en">Ask about {nombre_repo}</span>
-          <span class="label">{len(archivos_lista)} archivos indexados</span>
+    <div class="section-divider"><span class="lang-inline active" data-l="es">Explorar el código</span><span class="lang-inline" data-l="en">Explore the code</span></div>
+    <div class="grid-1"><div class="card">
+      <div class="card-header">
+        <span class="lang-content active" data-l="es">Pregunta sobre {nombre_repo}</span>
+        <span class="lang-content" data-l="en">Ask about {nombre_repo}</span>
+        <span class="label">{len(archivos_lista)} archivos indexados</span>
+      </div>
+      <div class="card-body" style="padding:0">
+        <div id="chat-messages" class="chat-messages">
+          <div class="chat-msg chat-msg-system">
+            <span class="lang-inline active" data-l="es">Tengo acceso a <strong>{len(archivos_lista)}</strong> archivos. Pregúntame lo que quieras.</span>
+            <span class="lang-inline" data-l="en">I have access to <strong>{len(archivos_lista)}</strong> files. Ask me anything.</span>
+          </div>
         </div>
-        <div class="card-body" style="padding:0">
-          <div id="chat-messages" class="chat-messages">
-            <div class="chat-msg chat-msg-system">
-              <span class="lang-inline active" data-l="es">Tengo acceso a <strong>{len(archivos_lista)}</strong> archivos. Pregúntame sobre el código, estructura o configuración.</span>
-              <span class="lang-inline" data-l="en">I have access to <strong>{len(archivos_lista)}</strong> files. Ask me about the code, structure or configuration.</span>
-            </div>
-          </div>
-          <div class="chat-suggestions" id="chat-suggestions">{sugerencias_html}</div>
-          <div class="chat-input-row">
-            <input type="text" id="chat-input"
-                   placeholder="¿Cómo funciona el login? / How does auth work?"
-                   class="chat-input"
-                   onkeydown="if(event.key==='Enter')enviarPregunta()">
-            <button class="chat-send-btn" onclick="enviarPregunta()">
-              <span class="lang-inline active" data-l="es">Buscar</span>
-              <span class="lang-inline" data-l="en">Search</span>
-            </button>
-          </div>
+        <div class="chat-suggestions" id="chat-suggestions">{sugerencias_html}</div>
+        <div class="chat-input-row">
+          <input type="text" id="chat-input" placeholder="¿Cómo funciona el login? / How does auth work?" class="chat-input" onkeydown="if(event.key==='Enter')enviarPregunta()">
+          <button class="chat-send-btn" onclick="enviarPregunta()">
+            <span class="lang-inline active" data-l="es">Buscar</span>
+            <span class="lang-inline" data-l="en">Search</span>
+          </button>
         </div>
       </div>
-    </div>
-
+    </div></div>
     <script>
     const ARCHIVOS_REPO={archivos_json};
     const README_REPO={readme_json};
     const KEYWORDS_MAP={{
-      "login":["login","auth","signin","sign_in","authenticate","session","jwt","token","password","credential"],
-      "registro":["register","signup","sign_up","create_user","new_user"],
-      "base de datos":["database","db","sql","mongo","postgres","mysql","sqlite","orm","model","schema","migration"],
-      "api":["api","endpoint","route","router","request","response","fetch","axios","http"],
-      "config":["config","settings","env","environment","dotenv","setup"],
-      "test":["test","spec","unittest","pytest","jest","describe","assert"],
-      "docker":["docker","container","dockerfile","compose","image"],
-      "deploy":["deploy","deployment","heroku","vercel","netlify","aws","production"],
-      "instalar":["install","setup","requirement","dependency","package","npm","pip","yarn"],
-      "seguridad":["security","cors","ssl","https","encrypt","hash","bcrypt"],
-      "cache":["cache","redis","memcache","session","cookie"],
-      "email":["email","mail","smtp","sendgrid","mailgun"],
-      "estructura":["structure","folder","directory","module","component","import","class"],
-      "dependencias":["import","require","dependency","package","library","module"],
+      "login":["login","auth","signin","sign_in","authenticate","session","jwt","token","password","credential","oauth","passport","bcrypt","hash","verify","user_id","current_user","logged"],
+      "registro":["register","signup","sign_up","create_user","new_user","registration"],
+      "base de datos":["database","db","sql","mongo","postgres","mysql","sqlite","orm","model","schema","migration","sequelize","mongoose","prisma","typeorm","knex","query","table","column","entity"],
+      "api":["api","endpoint","route","router","request","response","fetch","axios","http","rest","graphql","webhook","handler","controller","get(","post(","put(","delete(","patch("],
+      "config":["config","settings","env","environment","dotenv","setup","configuration","constant","variable","port","host","secret","key"],
+      "test":["test","spec","unittest","pytest","jest","describe","it(","assert","expect","mock","fixture","beforeeach","aftereach","beforeall"],
+      "docker":["docker","container","dockerfile","compose","image","kubernetes","k8s","helm","pod"],
+      "deploy":["deploy","deployment","heroku","vercel","netlify","aws","gcp","azure","cloud","production","staging","ci","cd","pipeline","workflow","action"],
+      "instalar":["install","setup","requirement","dependency","package","npm","pip","yarn","bundle","cargo","gem","poetry","venv"],
+      "seguridad":["security","cors","ssl","https","encrypt","hash","bcrypt","csrf","xss","injection","sanitize","validate","permission","role","guard","middleware"],
+      "cache":["cache","redis","memcache","session","cookie","ttl","expire"],
+      "email":["email","mail","smtp","sendgrid","mailgun","nodemailer","mailer","notification","send_mail"],
+      "estructura":["structure","folder","directory","module","component","import","class","function","def ","export","require","index"],
+      "dependencias":["import","require","dependency","package","library","module","from ","using","include"],
+      "middleware":["middleware","interceptor","guard","filter","pipe","decorator","before_action","after_action","use("],
+      "modelo":["model","entity","schema","table","class","interface","type","struct","record","document"],
+      "servicio":["service","provider","repository","dao","manager","client","adapter"],
+      "error":["error","exception","catch","throw","try","raise","handle","log","logger","debug","warn"],
+      "archivo":["file","upload","download","storage","s3","blob","stream","read","write","fs","path","multer"],
     }};
-
-    function escapeHtml(t){{
-      return t.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-    }}
-
-    function hacerPregunta(btn){{
-      document.getElementById('chat-input').value=btn.textContent.trim();
-      enviarPregunta();
-    }}
-
+    function escapeHtml(t){{return t.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}}
+    function hacerPregunta(btn){{document.getElementById('chat-input').value=btn.textContent.trim();enviarPregunta();}}
     function enviarPregunta(){{
       const input=document.getElementById('chat-input');
       const pregunta=input.value.trim();
-      if(!pregunta) return;
+      if(!pregunta)return;
       document.getElementById('chat-suggestions').style.display='none';
       agregarMensaje('user',pregunta);
       input.value='';
       const loadId='load-'+Date.now();
       agregarMensaje('loading','',loadId);
-      setTimeout(()=>{{
+      setTimeout(function(){{
         const resultados=buscarEnRepo(pregunta);
         const loadEl=document.getElementById(loadId);
-        if(loadEl) loadEl.remove();
+        if(loadEl)loadEl.remove();
         mostrarResultados(pregunta,resultados);
       }},150);
     }}
-
     function buscarEnRepo(pregunta){{
       const p=pregunta.toLowerCase();
       let palabras=[];
-      for(const [concepto,pals] of Object.entries(KEYWORDS_MAP)){{
-        if(pals.some(k=>p.includes(k))||p.includes(concepto)) palabras.push(...pals);
+      for(const concepto in KEYWORDS_MAP){{
+        const pals=KEYWORDS_MAP[concepto];
+        if(pals.some(function(k){{return p.includes(k);}})||p.includes(concepto))palabras=palabras.concat(pals);
       }}
-      if(!palabras.length) palabras=p.match(/\w{{3,}}/g)||[];
-      palabras=[...new Set(palabras)];
+      if(!palabras.length)palabras=(p.match(/\w{{3,}}/g)||[]);
+      const literales=(p.match(/\w{{3,}}/g)||[]);
+      palabras=[...new Set(palabras.concat(literales))];
       const resultados=[];
       const fuentes=Object.entries(ARCHIVOS_REPO);
-      if(README_REPO) fuentes.push(['README.md',README_REPO]);
-      for(const [archivo,contenido] of fuentes){{
+      if(README_REPO)fuentes.push(['README.md',README_REPO]);
+      for(let fi=0;fi<fuentes.length;fi++){{
+        const archivo=fuentes[fi][0];const contenido=fuentes[fi][1];
         const lineas=contenido.split('\\n');
-        let score=0; const fragmentos=[];
-        lineas.forEach((linea,i)=>{{
-          const ll=linea.toLowerCase();
-          const hits=palabras.filter(p=>ll.includes(p)).length;
+        let score=0;const fragmentos=[];
+        for(let i=0;i<lineas.length;i++){{
+          const ll=lineas[i].toLowerCase();
+          let hits=0;
+          for(let pi=0;pi<palabras.length;pi++){{if(ll.includes(palabras[pi]))hits++;}}
           if(hits>0){{
             score+=hits;
-            const inicio=Math.max(0,i-2); const fin=Math.min(lineas.length,i+10);
+            const inicio=Math.max(0,i-3);const fin=Math.min(lineas.length,i+12);
             const bloque=lineas.slice(inicio,fin).join('\\n').trim();
-            if(bloque&&!fragmentos.some(f=>f.bloque===bloque)) fragmentos.push({{hits,linea:i+1,bloque}});
+            if(bloque&&!fragmentos.some(function(f){{return f.bloque===bloque;}}))
+              fragmentos.push({{hits:hits,linea:i+1,bloque:bloque}});
           }}
-        }});
+        }}
         if(fragmentos.length){{
-          fragmentos.sort((a,b)=>b.hits-a.hits);
-          resultados.push({{archivo,score,linea:fragmentos[0].linea,fragmento:fragmentos[0].bloque,total:fragmentos.length}});
+          fragmentos.sort(function(a,b){{return b.hits-a.hits;}});
+          const mejores=fragmentos.slice(0,2);
+          resultados.push({{archivo:archivo,score:score,linea:mejores[0].linea,fragmento:mejores[0].bloque,extra:mejores.length>1?mejores[1].bloque:null,total:fragmentos.length}});
         }}
       }}
-      resultados.sort((a,b)=>b.score-a.score);
-      return resultados.slice(0,4);
+      resultados.sort(function(a,b){{return b.score-a.score;}});
+      return resultados.slice(0,5);
     }}
-
     function mostrarResultados(pregunta,resultados){{
       if(!resultados.length){{
-        agregarMensaje('assistant',`<div class="chat-no-results"><span class="lang-inline active" data-l="es">No encontré coincidencias para "<strong>${{escapeHtml(pregunta)}}</strong>".</span><span class="lang-inline" data-l="en">No matches for "<strong>${{escapeHtml(pregunta)}}</strong>".</span></div>`);
-        sincronizarLang(); return;
+        agregarMensaje('assistant','<div class="chat-no-results"><span class="lang-inline active" data-l="es">No encontré <strong>'+escapeHtml(pregunta)+'</strong> en los '+Object.keys(ARCHIVOS_REPO).length+' archivos. Prueba términos más específicos.</span><span class="lang-inline" data-l="en">No matches for <strong>'+escapeHtml(pregunta)+'</strong> across '+Object.keys(ARCHIVOS_REPO).length+' files.</span></div>');
+        sincronizarLang();return;
       }}
-      let html=`<div class="chat-results-header"><span class="lang-inline active" data-l="es">${{resultados.length}} archivo(s) con coincidencias:</span><span class="lang-inline" data-l="en">${{resultados.length}} file(s) with matches:</span></div>`;
-      resultados.forEach((r,i)=>{{
+      let html='<div class="chat-results-header"><span class="lang-inline active" data-l="es">'+resultados.length+' archivo(s) relevantes:</span><span class="lang-inline" data-l="en">'+resultados.length+' relevant file(s):</span></div>';
+      for(let i=0;i<resultados.length;i++){{
+        const r=resultados[i];
         const ext=r.archivo.includes('.')?r.archivo.split('.').pop():'file';
-        html+=`<div class="chat-result-block ${{i===0?'chat-result-top':''}}"><div class="chat-result-file"><span class="file-ext">${{ext.slice(0,6)}}</span><span class="chat-result-filename">${{r.archivo}}</span><span class="chat-result-line"><span class="lang-inline active" data-l="es">línea ${{r.linea}}</span><span class="lang-inline" data-l="en">line ${{r.linea}}</span></span><span class="chat-result-score">${{r.score}} hits</span></div><pre class="chat-code-block"><code>${{escapeHtml(r.fragmento)}}</code></pre></div>`;
-      }});
+        const partes=r.archivo.split('/');
+        const nombreCorto=partes.length>2?'.../ '+partes.slice(-2).join('/'):r.archivo;
+        html+='<div class="chat-result-block'+(i===0?' chat-result-top':'')+'"><div class="chat-result-file"><span class="file-ext">'+ext.slice(0,6)+'</span><span class="chat-result-filename" title="'+r.archivo+'">'+nombreCorto+'</span><span class="chat-result-line"><span class="lang-inline active" data-l="es">línea '+r.linea+'</span><span class="lang-inline" data-l="en">line '+r.linea+'</span></span><span class="chat-result-score">'+r.score+' hits</span></div><pre class="chat-code-block"><code>'+escapeHtml(r.fragmento)+'</code></pre>'+(r.extra?'<pre class="chat-code-block" style="border-top:1px solid var(--border);opacity:.8"><code>'+escapeHtml(r.extra)+'</code></pre>':'')+'</div>';
+      }}
       agregarMensaje('assistant',html);
       sincronizarLang();
     }}
-
     function sincronizarLang(){{
       const lang=document.documentElement.dataset.lang||'es';
-      document.querySelectorAll('.lang-inline').forEach(el=>{{
-        el.classList.toggle('active',el.dataset.l===lang);
-      }});
+      document.querySelectorAll('.lang-inline').forEach(function(el){{el.classList.toggle('active',el.dataset.l===lang);}});
     }}
-
-    function agregarMensaje(tipo,contenido,id=''){{
+    function agregarMensaje(tipo,contenido,id){{
       const container=document.getElementById('chat-messages');
       const div=document.createElement('div');
-      div.className=`chat-msg chat-msg-${{tipo}}`;
-      if(id) div.id=id;
-      if(tipo==='user'){{
-        div.innerHTML=`<span class="chat-msg-label">You</span><div class="chat-msg-text">${{escapeHtml(contenido)}}</div>`;
-      }}else if(tipo==='loading'){{
-        div.innerHTML=`<div class="chat-typing"><span></span><span></span><span></span></div>`;
-      }}else{{
-        div.innerHTML=`<span class="chat-msg-label">EnkiDocs</span><div class="chat-msg-text">${{contenido}}</div>`;
-      }}
+      div.className='chat-msg chat-msg-'+tipo;
+      if(id)div.id=id;
+      if(tipo==='user'){{div.innerHTML='<span class="chat-msg-label">You</span><div class="chat-msg-text">'+escapeHtml(contenido)+'</div>';}}
+      else if(tipo==='loading'){{div.innerHTML='<div class="chat-typing"><span></span><span></span><span></span></div>';}}
+      else{{div.innerHTML='<span class="chat-msg-label">EnkiDocs</span><div class="chat-msg-text">'+contenido+'</div>';}}
       container.appendChild(div);
       container.scrollTop=container.scrollHeight;
     }}
@@ -614,18 +662,34 @@ TEMPLATE = """
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>EnkiDocs</title>
+  <meta name="description" content="Analiza cualquier repositorio de GitHub al instante. Diagramas automáticos, guías de instalación y explorador de código.">
   <style>
     :root{--bg:#ffffff;--bg-card:#f6f8fa;--bg-header:#f6f8fa;--border:#d0d7de;--text:#24292f;--text-muted:#57606a;--link:#0969da;--green:#2da44e;--green-h:#2c974b;--nav-bg:#24292f;--nav-text:#ffffff;--shadow:0 1px 3px rgba(0,0,0,0.08);--step-bg:#ddf4ff;--step-num:#0969da;--code-bg:#f6f8fa;}
     [data-theme="dark"]{--bg:#0d1117;--bg-card:#161b22;--bg-header:#21262d;--border:#30363d;--text:#e6edf3;--text-muted:#8b949e;--link:#58a6ff;--green:#238636;--green-h:#2ea043;--nav-bg:#161b22;--nav-text:#e6edf3;--shadow:0 1px 3px rgba(0,0,0,0.4);--step-bg:#1c2a3a;--step-num:#58a6ff;--code-bg:#161b22;}
     *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
     body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;font-size:14px;line-height:1.6;color:var(--text);background:var(--bg);transition:background .2s,color .2s}
+
+    /* NAV */
     .nav{background:var(--nav-bg);padding:0 24px;height:52px;display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;z-index:100;border-bottom:1px solid var(--border)}
     .nav-left{display:flex;align-items:center;gap:20px}
-    .nav-logo{color:var(--nav-text);font-size:15px;font-weight:600;letter-spacing:-.3px}
+    .nav-logo{color:var(--nav-text);font-size:15px;font-weight:600;letter-spacing:-.3px;text-decoration:none;display:flex;align-items:center;gap:6px}
     .nav-logo span{color:#58a6ff}
-    .nav-right{display:flex;align-items:center;gap:8px}
-    .btn-nav{background:transparent;border:1px solid #444d56;color:#8b949e;border-radius:6px;padding:4px 10px;font-size:12px;cursor:pointer;transition:border-color .2s,color .2s}
+    .nav-logo:hover{opacity:.85}
+    .nav-right{display:flex;align-items:center;gap:6px}
+    .btn-nav{background:transparent;border:1px solid #444d56;color:#8b949e;border-radius:6px;padding:5px 10px;font-size:12px;cursor:pointer;transition:border-color .2s,color .2s;display:flex;align-items:center;gap:5px}
     .btn-nav:hover{border-color:#8b949e;color:var(--nav-text)}
+    .btn-nav svg{width:14px;height:14px;flex-shrink:0}
+    .btn-github{background:transparent;border:1px solid #444d56;color:#8b949e;border-radius:6px;padding:5px 10px;font-size:12px;cursor:pointer;text-decoration:none;display:flex;align-items:center;gap:5px;transition:border-color .2s,color .2s}
+    .btn-github:hover{border-color:#8b949e;color:var(--nav-text)}
+    .btn-github svg{width:14px;height:14px;flex-shrink:0}
+    .lang-dropdown{position:relative}
+    .lang-menu{display:none;position:absolute;top:calc(100% + 6px);right:0;background:var(--bg);border:1px solid var(--border);border-radius:8px;box-shadow:0 8px 24px rgba(0,0,0,0.15);z-index:200;min-width:140px;overflow:hidden}
+    .lang-menu.open{display:block}
+    .lang-option{display:flex;align-items:center;gap:8px;padding:8px 14px;font-size:13px;color:var(--text);cursor:pointer;transition:background .1s}
+    .lang-option:hover{background:var(--bg-card)}
+    .lang-option.active{color:var(--link);font-weight:500}
+    .lang-flag{font-size:14px}
+
     .container{max-width:1000px;margin:0 auto;padding:32px 20px 64px}
     .search-block{margin-bottom:36px}
     .search-block h1{font-size:22px;font-weight:600;margin-bottom:6px}
@@ -648,7 +712,6 @@ TEMPLATE = """
     .scroll::-webkit-scrollbar-track{background:var(--bg-card)}
     .scroll::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
     .scroll::-webkit-scrollbar-thumb:hover{background:var(--text-muted)}
-
     .chat-messages{min-height:80px;max-height:480px;overflow-y:auto;padding:16px;display:flex;flex-direction:column;gap:12px;border-bottom:1px solid var(--border)}
     .chat-messages::-webkit-scrollbar{width:6px}
     .chat-messages::-webkit-scrollbar-track{background:var(--bg-card)}
@@ -686,8 +749,6 @@ TEMPLATE = """
     .chat-input:focus{border-color:var(--link);box-shadow:0 0 0 3px rgba(9,105,218,.1)}
     .chat-send-btn{padding:8px 16px;font-size:13px;font-weight:500;color:#fff;background:var(--link);border:none;border-radius:6px;cursor:pointer;transition:opacity .15s;white-space:nowrap}
     .chat-send-btn:hover{opacity:.85}
-
-    /* RESTO */
     .perfil-hero{display:flex;gap:20px;align-items:flex-start}
     .perfil-avatar{width:80px;height:80px;border-radius:50%;border:2px solid var(--border);flex-shrink:0;background:var(--bg-card)}
     .perfil-info{flex:1;min-width:0}
@@ -839,26 +900,78 @@ TEMPLATE = """
       .perfil-hero{flex-direction:column;align-items:center;text-align:center}
       .tips-grid{grid-template-columns:1fr}
       .repo-row-right{display:none}
+      .btn-github span{display:none}
     }
   </style>
 </head>
 <body>
 <nav class="nav">
-  <div class="nav-left"><span class="nav-logo">Enki<span>Docs</span></span></div>
+  <div class="nav-left">
+    <a href="https://github.com/ChristianUtria/enkiDOCS" target="_blank" class="nav-logo">
+      Enki<span>Docs</span>
+    </a>
+  </div>
   <div class="nav-right">
-    <button class="btn-nav" onclick="toggleLang()">EN / ES</button>
-    <button class="btn-nav" onclick="toggleTheme()">Dark / Light</button>
+
+    <!-- GitHub -->
+    <a href="https://github.com/ChristianUtria/enkiDOCS" target="_blank" class="btn-github">
+      <svg viewBox="0 0 24 24" fill="currentColor">
+        <path d="M12 0C5.374 0 0 5.373 0 12c0 5.302 3.438 9.8 8.207 11.387.599.111.793-.261.793-.577v-2.234c-3.338.726-4.033-1.416-4.033-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.467-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23A11.509 11.509 0 0112 5.803c1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.929.43.372.823 1.102.823 2.222v3.293c0 .319.192.694.801.576C20.566 21.797 24 17.3 24 12c0-6.627-5.373-12-12-12z"/>
+      </svg>
+      <span>GitHub</span>
+    </a>
+
+    <!-- Idioma dropdown -->
+    <div class="lang-dropdown">
+      <button class="btn-nav" onclick="toggleLangMenu()" id="lang-btn">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="12" cy="12" r="10"/>
+          <line x1="2" y1="12" x2="22" y2="12"/>
+          <path d="M12 2a15.3 15.3 0 010 20M12 2a15.3 15.3 0 000 20"/>
+        </svg>
+        <span id="lang-label">ES</span>
+      </button>
+      <div class="lang-menu" id="lang-menu">
+        <div class="lang-option active" data-lang="es" onclick="setLang('es')"><span class="lang-flag">🇪🇸</span> Español</div>
+        <div class="lang-option" data-lang="en" onclick="setLang('en')"><span class="lang-flag">🇬🇧</span> English</div>
+        <div class="lang-option" data-lang="fr" onclick="setLang('fr')"><span class="lang-flag">🇫🇷</span> Français</div>
+        <div class="lang-option" data-lang="pt" onclick="setLang('pt')"><span class="lang-flag">🇧🇷</span> Português</div>
+        <div class="lang-option" data-lang="de" onclick="setLang('de')"><span class="lang-flag">🇩🇪</span> Deutsch</div>
+      </div>
+    </div>
+
+    <!-- Tema -->
+    <button class="btn-nav" onclick="toggleTheme()" id="theme-btn" title="Toggle theme">
+      <svg id="icon-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"/>
+      </svg>
+      <svg id="icon-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:none">
+        <circle cx="12" cy="12" r="5"/>
+        <line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/>
+        <line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/>
+        <line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/>
+        <line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/>
+      </svg>
+    </button>
+
   </div>
 </nav>
+
 <div class="container">
   <div class="search-block">
     <h1>
       <span class="lang-content active" data-l="es">Analiza GitHub</span>
       <span class="lang-content" data-l="en">Analyze GitHub</span>
+      <span class="lang-content" data-l="fr">Analysez GitHub</span>
+      <span class="lang-content" data-l="pt">Analise o GitHub</span>
+      <span class="lang-content" data-l="de">GitHub analysieren</span>
     </h1>
     <p>
       <span class="lang-content active" data-l="es">Pega una URL de repositorio, usuario u organización de GitHub.</span>
       <span class="lang-content" data-l="en">Paste a GitHub repository, user or organization URL.</span>
+      <span class="lang-content" data-l="fr">Collez une URL de dépôt, utilisateur ou organisation GitHub.</span>
+      <span class="lang-content" data-l="pt">Cole uma URL de repositório, usuário ou organização do GitHub.</span>
+      <span class="lang-content" data-l="de">Füge eine GitHub Repository-, Benutzer- oder Organisations-URL ein.</span>
     </p>
     <form method="POST">
       <div class="search-row">
@@ -868,21 +981,89 @@ TEMPLATE = """
         <button type="submit">
           <span class="lang-content active" data-l="es">Analizar</span>
           <span class="lang-content" data-l="en">Analyze</span>
+          <span class="lang-content" data-l="fr">Analyser</span>
+          <span class="lang-content" data-l="pt">Analisar</span>
+          <span class="lang-content" data-l="de">Analysieren</span>
         </button>
       </div>
     </form>
   </div>
   {{ resultado|safe }}
-  <div class="footer">EnkiDocs &middot; Flask + GitHub API</div>
+  <div class="footer">EnkiDocs &middot; Flask + GitHub API &middot; <a href="https://github.com/ChristianUtria/enkiDOCS" target="_blank" class="info-link">Open Source</a></div>
 </div>
+
 <script>
-const html=document.documentElement;
-function toggleTheme(){html.dataset.theme=html.dataset.theme==='dark'?'light':'dark';localStorage.setItem('theme',html.dataset.theme)}
-function toggleLang(){const lang=html.dataset.lang==='es'?'en':'es';html.dataset.lang=lang;localStorage.setItem('lang',lang);document.querySelectorAll('.lang-content,.lang-inline').forEach(el=>{el.classList.toggle('active',el.dataset.l===lang)})}
-function copyCmd(btn){const text=btn.previousElementSibling.textContent.trim();navigator.clipboard.writeText(text).then(()=>{btn.textContent='copied';setTimeout(()=>btn.textContent='copy',1500)})}
-const savedTheme=localStorage.getItem('theme');const savedLang=localStorage.getItem('lang');
-if(savedTheme)html.dataset.theme=savedTheme;
-if(savedLang&&savedLang!=='es')toggleLang();
+const html = document.documentElement;
+
+// ── Tema ──────────────────────────────────────────────────────────────────
+function toggleTheme() {
+  const dark = html.dataset.theme !== 'dark';
+  html.dataset.theme = dark ? 'dark' : 'light';
+  localStorage.setItem('theme', html.dataset.theme);
+  updateThemeIcon();
+}
+function updateThemeIcon() {
+  const dark = html.dataset.theme === 'dark';
+  document.getElementById('icon-moon').style.display = dark ? 'none' : 'block';
+  document.getElementById('icon-sun').style.display  = dark ? 'block' : 'none';
+}
+
+// ── Idioma ────────────────────────────────────────────────────────────────
+const LANGS = { es:{label:'ES'}, en:{label:'EN'}, fr:{label:'FR'}, pt:{label:'PT'}, de:{label:'DE'} };
+
+function toggleLangMenu() {
+  document.getElementById('lang-menu').classList.toggle('open');
+}
+
+document.addEventListener('click', function(e) {
+  if (!e.target.closest('.lang-dropdown')) {
+    document.getElementById('lang-menu').classList.remove('open');
+  }
+});
+
+function setLang(lang) {
+  html.dataset.lang = lang;
+  localStorage.setItem('lang', lang);
+  document.getElementById('lang-label').textContent = LANGS[lang]?.label || lang.toUpperCase();
+  document.getElementById('lang-menu').classList.remove('open');
+  document.querySelectorAll('.lang-option').forEach(el => {
+    el.classList.toggle('active', el.dataset.lang === lang);
+  });
+  // Para fr/pt/de usar contenido en inglés como fallback
+  const fallback = ['fr','pt','de'].includes(lang) ? 'en' : lang;
+  document.querySelectorAll('.lang-content,.lang-inline').forEach(el => {
+    const elLang = el.dataset.l;
+    if (['fr','pt','de'].includes(lang)) {
+      el.classList.toggle('active', elLang === lang || (elLang === 'en' && !document.querySelector('[data-l="'+lang+'"]')));
+    } else {
+      el.classList.toggle('active', elLang === lang);
+    }
+  });
+  // Fallback: si no hay elementos con el idioma, usar inglés
+  if (['fr','pt','de'].includes(lang)) {
+    const hasLangContent = document.querySelectorAll('[data-l="'+lang+'"]').length > 0;
+    if (!hasLangContent) {
+      document.querySelectorAll('.lang-content,.lang-inline').forEach(el => {
+        el.classList.toggle('active', el.dataset.l === 'en');
+      });
+    }
+  }
+}
+
+function copyCmd(btn) {
+  const text = btn.previousElementSibling.textContent.trim();
+  navigator.clipboard.writeText(text).then(() => {
+    btn.textContent = 'copied';
+    setTimeout(() => btn.textContent = 'copy', 1500);
+  });
+}
+
+// ── Restaurar preferencias ────────────────────────────────────────────────
+const savedTheme = localStorage.getItem('theme');
+const savedLang  = localStorage.getItem('lang');
+if (savedTheme) html.dataset.theme = savedTheme;
+updateThemeIcon();
+if (savedLang && LANGS[savedLang]) setLang(savedLang);
 </script>
 </body>
 </html>
